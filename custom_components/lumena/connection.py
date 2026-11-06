@@ -39,6 +39,8 @@ class LumenaConnection:
         self._socket = None
         self._watch: set[str] = set()
         self._unsub_states = None
+        # tuneli: stalne websocket veze prema lokalnom HA (npr. WebRTC kamere)
+        self._tunnels: dict[str, Any] = {}
 
     # ------------------------------------------------------------ start/stop
 
@@ -141,6 +143,7 @@ class LumenaConnection:
                         "secret": self.entry.data[CONF_SECRET],
                         "ha_version": HA_VERSION,
                         "location_name": self.hass.config.location_name,
+                        "features": ["tunnel"],
                     })
                     welcome = await ws.receive_json(timeout=20)
 
@@ -161,22 +164,91 @@ class LumenaConnection:
                                 self._watch = set(request.get("entities") or [])
                                 continue
 
+                            if request.get("type") == "tunnel_open":
+                                self.hass.async_create_task(self._tunnel_open(ws, str(request.get("tunnel"))))
+                                continue
+
+                            if request.get("type") == "tunnel":
+                                tunnel = self._tunnels.get(str(request.get("tunnel")))
+                                if tunnel is not None and not tunnel.closed:
+                                    self.hass.async_create_task(tunnel.send_str(str(request.get("data") or "")))
+                                continue
+
+                            if request.get("type") == "tunnel_close":
+                                tunnel = self._tunnels.pop(str(request.get("tunnel")), None)
+                                if tunnel is not None:
+                                    self.hass.async_create_task(tunnel.close())
+                                continue
+
                             self.hass.async_create_task(self._answer(ws, request))
                         elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
             except asyncio.CancelledError:
                 self._socket = None
+                await self._close_tunnels()
                 raise
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Lumena: veza prekinuta (%s), ponovo za %s s", exc, delay)
 
             self._socket = None
+            await self._close_tunnels()
 
             if self._stopping:
                 return
 
             await asyncio.sleep(delay)
             delay = min(delay * 2, RETRY_MAX)
+
+    # ------------------------------------------------------------ tuneli
+
+    async def _close_tunnels(self) -> None:
+        tunnels, self._tunnels = self._tunnels, {}
+
+        for tunnel in tunnels.values():
+            try:
+                await tunnel.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _tunnel_open(self, ws, tunnel_id: str) -> None:
+        """Otvori lokalni HA websocket (već prijavljen) i prenosi poruke
+        u oba smjera dok ga Perfectus ne zatvori."""
+
+        session = async_get_clientsession(self.hass, verify_ssl=False)
+        url = self._local_url().replace("http", "ws", 1) + "/api/websocket"
+        local = None
+
+        try:
+            local = await session.ws_connect(url, max_msg_size=MAX_MESSAGE, heartbeat=30)
+            await local.receive_json(timeout=10)
+            await local.send_json({"type": "auth", "access_token": self._token()})
+            auth = await local.receive_json(timeout=10)
+
+            if auth.get("type") != "auth_ok":
+                raise ConnectionError("Lokalni Home Assistant je odbio konektor.")
+
+            self._tunnels[tunnel_id] = local
+            await ws.send_str(json.dumps({"type": "tunnel_ready", "tunnel": tunnel_id}))
+
+            async for message in local:
+                if message.type != aiohttp.WSMsgType.TEXT:
+                    if message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+                    continue
+                if ws.closed:
+                    break
+                await ws.send_str(json.dumps({"type": "tunnel", "tunnel": tunnel_id, "data": message.data}))
+            error = None
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)[:200] or type(exc).__name__
+        finally:
+            self._tunnels.pop(tunnel_id, None)
+
+            if local is not None and not local.closed:
+                await local.close()
+
+        if not ws.closed:
+            await ws.send_str(json.dumps({"type": "tunnel_closed", "tunnel": tunnel_id, "error": error}))
 
     async def _answer(self, ws, request: dict[str, Any]) -> None:
         request_id = request.get("id")
