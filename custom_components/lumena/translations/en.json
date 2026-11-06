@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Povezivanje sa Perfectusom",
+        "description": "U Perfectusu otvorite Smart podešavanja → Podešavanja → Lumena konektor → Napravi kod. Upišite adresu Perfectusa i kod.",
+        "data": {
+          "server_url": "Adresa Perfectusa (npr. https://app.vasa-domena.ba)",
+          "code": "Kod za povezivanje"
+        }
+      }
+    },
+    "error": {
+      "invalid_code": "Kod nije ispravan ili je istekao. Napravite novi u Perfectusu.",
+      "cannot_connect": "Nije moguće spojiti se na Perfectus. Provjerite adresu."
+    },
+    "abort": {
+      "already_configured": "Ovaj Perfectus je već povezan (podaci su osvježeni)."
+    }
+  }
+}
