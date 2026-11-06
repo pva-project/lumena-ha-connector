@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 from datetime import timedelta
 from typing import Any
@@ -13,7 +14,8 @@ import aiohttp
 from homeassistant.auth.const import GROUP_ID_ADMIN
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import __version__ as HA_VERSION
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import CONF_SECRET, CONF_SERVER_URL, CONF_USER_ID, SOCKET_PATH, USER_NAME
@@ -34,15 +36,23 @@ class LumenaConnection:
         self._access_token: str | None = None
         self._access_created = 0.0
         self._stopping = False
+        self._socket = None
+        self._watch: set[str] = set()
+        self._unsub_states = None
 
     # ------------------------------------------------------------ start/stop
 
     async def async_start(self) -> None:
         await self._ensure_user()
+        self._unsub_states = self.hass.bus.async_listen(EVENT_STATE_CHANGED, self._on_state)
         self._task = self.hass.async_create_background_task(self._run(), "lumena-connector")
 
     async def async_stop(self) -> None:
         self._stopping = True
+
+        if self._unsub_states is not None:
+            self._unsub_states()
+            self._unsub_states = None
 
         if self._task is not None:
             self._task.cancel()
@@ -88,6 +98,33 @@ class LumenaConnection:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token()}"}
 
+    # ------------------------------------------------------------ uživo
+
+    @callback
+    def _on_state(self, event: Event) -> None:
+        """Javi Perfectusu promjenu stanja (samo za entitete koje prati)."""
+
+        entity_id = event.data.get("entity_id")
+        ws = self._socket
+
+        if ws is None or ws.closed or entity_id not in self._watch:
+            return
+
+        new_state = event.data.get("new_state")
+        payload = {
+            "type": "state",
+            "entity_id": entity_id,
+            "state": None if new_state is None else {
+                "entity_id": entity_id,
+                "state": new_state.state,
+                "attributes": dict(new_state.attributes),
+                "last_changed": new_state.last_changed.isoformat(),
+                "last_updated": new_state.last_updated.isoformat(),
+            },
+        }
+
+        self.hass.async_create_task(ws.send_str(json.dumps(payload, default=str)))
+
     # ------------------------------------------------------------ veza
 
     async def _run(self) -> None:
@@ -114,17 +151,26 @@ class LumenaConnection:
 
                     _LOGGER.info("Lumena: povezano sa %s", server)
                     delay = RETRY_MIN
+                    self._socket = ws
 
                     async for message in ws:
                         if message.type == aiohttp.WSMsgType.TEXT:
                             request = message.json()
+
+                            if request.get("type") == "watch" and "id" not in request:
+                                self._watch = set(request.get("entities") or [])
+                                continue
+
                             self.hass.async_create_task(self._answer(ws, request))
                         elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
             except asyncio.CancelledError:
+                self._socket = None
                 raise
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Lumena: veza prekinuta (%s), ponovo za %s s", exc, delay)
+
+            self._socket = None
 
             if self._stopping:
                 return
@@ -154,7 +200,7 @@ class LumenaConnection:
             response = {"id": request_id, "ok": False, "error": str(exc)[:300]}
 
         if not ws.closed:
-            await ws.send_json(response)
+            await ws.send_str(json.dumps(response, default=str))
 
     async def _http(self, request: dict[str, Any]) -> dict[str, Any]:
         session = async_get_clientsession(self.hass, verify_ssl=False)
