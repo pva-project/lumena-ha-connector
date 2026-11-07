@@ -295,6 +295,8 @@ class LumenaConnection:
                 result = await self._ws(request.get("requests") or [])
             elif kind == "upload":
                 result = await self._upload(request)
+            elif kind == "go2rtc_webrtc":
+                result = await self._go2rtc_webrtc(request)
             elif kind == "ping":
                 result = {"pong": True}
             else:
@@ -306,6 +308,55 @@ class LumenaConnection:
 
         if not ws.closed:
             await ws.send_str(json.dumps(response, default=str))
+
+    async def _go2rtc_webrtc(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Razgovor sa interfonom: WebRTC ponuda → go2rtc u lokalnoj mreži.
+        Dozvoljena je samo lokalna adresa i samo /api/webrtc."""
+
+        import ipaddress
+        import re
+        from urllib.parse import quote, urlparse
+
+        base = str(request.get("base") or "http://127.0.0.1:1984").rstrip("/")
+        parsed = urlparse(base)
+
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.path not in ("", "/"):
+            raise ValueError("Neispravna adresa go2rtc-a.")
+
+        host = parsed.hostname
+        try:
+            if not ipaddress.ip_address(host).is_private:
+                raise ValueError("go2rtc mora biti u lokalnoj mreži.")
+        except ValueError as exc:
+            if "lokalnoj" in str(exc):
+                raise
+            if "." in host and not host.endswith((".local", ".lan", ".home")):
+                raise ValueError("go2rtc mora biti u lokalnoj mreži.") from None
+
+        src = str(request.get("src") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", src):
+            raise ValueError("Neispravan naziv toka.")
+
+        session = async_get_clientsession(self.hass, verify_ssl=False)
+        async with session.post(
+            f"{base}/api/webrtc?src={quote(src)}",
+            json={"type": "offer", "sdp": str(request.get("sdp") or "")},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as response:
+            text = await response.text()
+            if response.status >= 400:
+                raise ValueError(f"go2rtc HTTP {response.status}: {text[:200]}")
+
+        try:
+            data = json.loads(text)
+            answer = data.get("sdp") if isinstance(data, dict) else None
+        except ValueError:
+            answer = text
+
+        if not answer:
+            raise ValueError("go2rtc nije vratio odgovor.")
+
+        return {"sdp": answer}
 
     async def _http(self, request: dict[str, Any]) -> dict[str, Any]:
         session = async_get_clientsession(self.hass, verify_ssl=False)
