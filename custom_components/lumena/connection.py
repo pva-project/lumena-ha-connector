@@ -38,6 +38,9 @@ class LumenaConnection:
         self._stopping = False
         self._socket = None
         self._watch: set[str] = set()
+        # HA događaji koje Perfectus prati (npr. dahua_vto = zvono interfona)
+        self._event_types: set[str] = set()
+        self._event_unsubs: dict[str, Any] = {}
         self._unsub_states = None
         # tuneli: stalne websocket veze prema lokalnom HA (npr. WebRTC kamere)
         self._tunnels: dict[str, Any] = {}
@@ -55,6 +58,8 @@ class LumenaConnection:
         if self._unsub_states is not None:
             self._unsub_states()
             self._unsub_states = None
+
+        self._set_event_types(set())
 
         if self._task is not None:
             self._task.cancel()
@@ -127,6 +132,30 @@ class LumenaConnection:
 
         self.hass.async_create_task(ws.send_str(json.dumps(payload, default=str)))
 
+    @callback
+    def _set_event_types(self, types: set[str]) -> None:
+        """Pretplata na HA događaje koje traži Perfectus."""
+
+        for event_type in list(self._event_unsubs):
+            if event_type not in types:
+                self._event_unsubs.pop(event_type)()
+
+        for event_type in types:
+            if event_type not in self._event_unsubs:
+                self._event_unsubs[event_type] = self.hass.bus.async_listen(event_type, self._on_event)
+
+        self._event_types = set(types)
+
+    @callback
+    def _on_event(self, event: Event) -> None:
+        ws = self._socket
+
+        if ws is None or ws.closed:
+            return
+
+        payload = {"type": "event", "event_type": event.event_type, "data": dict(event.data)}
+        self.hass.async_create_task(ws.send_str(json.dumps(payload, default=str)))
+
     # ------------------------------------------------------------ veza
 
     async def _run(self) -> None:
@@ -162,6 +191,10 @@ class LumenaConnection:
 
                             if request.get("type") == "watch" and "id" not in request:
                                 self._watch = set(request.get("entities") or [])
+                                self._set_event_types({
+                                    str(item) for item in (request.get("events") or [])
+                                    if item and str(item) != EVENT_STATE_CHANGED
+                                })
                                 continue
 
                             if request.get("type") == "tunnel_open":
