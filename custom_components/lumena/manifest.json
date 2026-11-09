@@ -3,10 +3,13 @@
   "name": "Lumena Connector",
   "codeowners": [],
   "config_flow": true,
-  "dependencies": ["http", "media_source"],
+  "dependencies": [
+    "http",
+    "media_source"
+  ],
   "documentation": "https://github.com/pva-project/lumena-ha-connector",
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/pva-project/lumena-ha-connector/issues",
   "requirements": [],
-  "version": "0.5.0"
+  "version": "0.5.1"
 }
